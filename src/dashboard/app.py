@@ -161,9 +161,18 @@ def _page_backtest(features: pd.DataFrame) -> None:
     """Render the backtest-results page."""
     st.header("Backtest results")
     if st.button("Run backtest"):
-        with st.spinner("Running walk-forward backtest..."):
-            result = run_backtest(features, include_autoencoder=False)
-            metrics = compute_metrics(result.strategy_returns, result.equity_curve, result.trades)
+        try:
+            with st.spinner("Running walk-forward backtest..."):
+                result = run_backtest(features, include_autoencoder=False)
+                metrics = compute_metrics(
+                    result.strategy_returns, result.equity_curve, result.trades
+                )
+        except ValueError as exc:
+            st.warning(
+                f"Backtest needs a longer history ({exc}). Set the sidebar "
+                "'Data start date' to about 2021 or earlier, then re-run."
+            )
+            return
 
         st.subheader("Summary metrics")
         st.dataframe(pd.Series(metrics.as_dict()).to_frame("value"), use_container_width=True)
