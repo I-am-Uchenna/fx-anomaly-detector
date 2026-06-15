@@ -155,6 +155,13 @@ def main() -> None:
     with st.spinner("Scanning the FX market..."):
         scores, feats = build_scores(years)
 
+    if not feats:
+        st.error("No FX data could be loaded right now. Please refresh in a moment.")
+        st.stop()
+    if focus not in feats:
+        focus = next(iter(feats))
+        pair_label = PAIRS[focus]
+
     latest_date = scores.dropna(how="all").index.max()
     latest = scores.loc[latest_date]
     mean_stress = float(latest.mean())
