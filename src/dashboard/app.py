@@ -191,7 +191,7 @@ def main() -> None:
     st.set_page_config(page_title="FX Anomaly Detector", layout="wide")
     st.title("FX Anomaly Detector")
 
-    start = st.sidebar.text_input("Data start date", settings.DATA_START_DATE)
+    start = st.sidebar.text_input("Data start date", "2024-01-01")
     include_ae = st.sidebar.checkbox("Include autoencoder", value=False)
     page = st.sidebar.radio(
         "Page", ["Live monitor", "Pair deep dive", "Regime analysis", "Backtest results"]
