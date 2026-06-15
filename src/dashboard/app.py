@@ -120,7 +120,7 @@ def _page_pair_deep_dive(features: pd.DataFrame, ens: pd.DataFrame) -> None:
     st.subheader("Feature time series")
     feature_names = [c for c in features[pair].columns if c not in {"open", "high", "low", "close"}]
     chosen = st.selectbox("Feature", feature_names)
-    st.line_chart(features[(pair, chosen)])
+    st.line_chart(features[(pair, chosen)].rename(chosen))
 
     st.subheader("Detector score breakdown")
     score_cols = [c for c in pair_ens.columns if c.startswith("score_")]
