@@ -1,221 +1,244 @@
-"""Streamlit dashboard for the FX anomaly detector.
+"""FX Anomaly Radar - a fast, focused anomaly monitor for G10 majors.
 
-Run from the project root:
-    streamlit run src/dashboard/app.py
-
-Four pages: a live monitor, a per-pair deep dive, regime analysis, and backtest
-results. Expensive pipeline steps are cached so navigation stays responsive.
+Single-page Streamlit app. The engine is fully vectorised (no per-row apply,
+no GARCH/HMM/autoencoder), so a cold start renders in seconds. Anomaly scores
+blend a robust multivariate z-score with an Isolation Forest, both computed on
+a tight, economically motivated feature set.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
+from sklearn.ensemble import IsolationForest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+PAIRS: dict[str, str] = {
+    "EURUSD=X": "EUR/USD",
+    "GBPUSD=X": "GBP/USD",
+    "USDJPY=X": "USD/JPY",
+    "AUDUSD=X": "AUD/USD",
+    "USDCAD=X": "USD/CAD",
+    "USDCHF=X": "USD/CHF",
+}
+ROLL = 63  # ~1 quarter, the lookback for rolling statistics
 
-from config import settings  # noqa: E402
-from src.backtest.engine import run_backtest  # noqa: E402
-from src.backtest.metrics import compute_metrics  # noqa: E402
-from src.data.fetcher import fetch_fx_data  # noqa: E402
-from src.detectors import ensemble  # noqa: E402
-from src.detectors.regime import compute_regimes  # noqa: E402
-from src.features.builder import build_features  # noqa: E402
+st.set_page_config(page_title="FX Anomaly Radar", page_icon="📡", layout="wide")
 
-_TRAFFIC = {0: "🟢", 1: "🟡", 2: "🔴"}
+_CSS = """
+<style>
+.block-container {padding-top: 2.2rem; max-width: 1250px;}
+#MainMenu, footer {visibility: hidden;}
+.hero h1 {font-size: 2.1rem; margin-bottom: .1rem; font-weight: 700;}
+.hero p {color: #9aa0aa; margin-top: 0; font-size: .95rem;}
+div[data-testid="stMetric"] {
+  background: #161B26; border: 1px solid #232a38; border-radius: 14px;
+  padding: 16px 18px;
+}
+div[data-testid="stMetricLabel"] p {color:#9aa0aa; font-size:.78rem; letter-spacing:.04em;}
+</style>
+"""
+st.markdown(_CSS, unsafe_allow_html=True)
 
 
-@st.cache_data(show_spinner="Fetching live data and building features...")
-def load_features(start: str) -> pd.DataFrame:
-    """Fetch live data and build the feature frame (cached).
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_prices(years: int) -> dict[str, pd.DataFrame]:
+    """Download recent daily OHLC for each pair from Yahoo Finance.
 
     Args:
-        start: Start date for the data download.
+        years: Number of years of history to fetch.
 
     Returns:
-        The feature DataFrame.
+        Mapping of symbol to a tz-naive OHLC DataFrame.
     """
-    raw = fetch_fx_data(start=start)
-    return build_features(raw, persist=False, validate=False)
+    start = (pd.Timestamp.today() - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
+    out: dict[str, pd.DataFrame] = {}
+    for symbol in PAIRS:
+        raw = yf.download(symbol, start=start, interval="1d", auto_adjust=False, progress=False)
+        if raw is None or raw.empty:
+            continue
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        frame = raw[["Open", "High", "Low", "Close"]].copy()
+        frame.columns = ["open", "high", "low", "close"]
+        frame.index = pd.to_datetime(frame.index).tz_localize(None).normalize()
+        out[symbol] = frame.dropna()
+    return out
 
 
-@st.cache_data(show_spinner="Running detectors...")
-def load_detections(start: str, include_autoencoder: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run the ensemble and return (features, ensemble_long) (cached).
+def _zscore(series: pd.Series, window: int = ROLL) -> pd.Series:
+    """Trailing rolling z-score of a series."""
+    roll = series.rolling(window)
+    return (series - roll.mean()) / roll.std(ddof=0)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_scores(years: int) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Compute anomaly scores for every pair (fully vectorised).
 
     Args:
-        start: Start date for the data download.
-        include_autoencoder: Whether to include the autoencoder.
+        years: History length to load.
 
     Returns:
-        A tuple of the feature frame and the ensemble long DataFrame.
+        A tuple of (scores wide-frame indexed by date with one column per pair,
+        per-pair feature frames including close and the components).
     """
-    features = load_features(start)
-    ens = ensemble.detect(features, include_autoencoder=include_autoencoder)
-    return features, ens
+    prices = load_prices(years)
+    returns = pd.DataFrame({s: np.log(df["close"]).diff() for s, df in prices.items()})
+    basket = returns.mean(axis=1)
 
+    feats: dict[str, pd.DataFrame] = {}
+    score_cols: dict[str, pd.Series] = {}
+    for symbol, df in prices.items():
+        r = np.log(df["close"]).diff()
+        vol = r.rolling(21).std(ddof=0)
+        rng = (df["high"] - df["low"]) / df["close"]
+        corr = r.rolling(ROLL).corr(basket)
 
-def _page_live_monitor(features: pd.DataFrame, ens: pd.DataFrame) -> None:
-    """Render the live monitor page."""
-    st.header("Live monitor")
-    latest_date = ens["datetime"].max()
-    st.caption(f"Last update: {latest_date}")
-
-    latest = ens[ens["datetime"] == latest_date]
-    score_pivot = latest.pivot_table(index="pair", values="ensemble_score")
-    fig = go.Figure(
-        go.Heatmap(
-            z=[score_pivot["ensemble_score"].values],
-            x=score_pivot.index,
-            y=["score"],
-            colorscale="OrRd",
-            zmin=0,
-            zmax=1,
+        z = pd.DataFrame(
+            {
+                "return": _zscore(r),
+                "volatility": _zscore(vol),
+                "range": _zscore(rng),
+                "correlation": _zscore(corr),
+            }
         )
-    )
-    fig.update_layout(title="Current ensemble anomaly scores")
-    st.plotly_chart(fig, use_container_width=True)
+        # Robust multivariate deviation: RMS of the component z-scores.
+        rms = np.sqrt((z**2).mean(axis=1))
+        stat_score = 1.0 - np.exp(-rms / 2.5)
 
-    st.subheader("Active anomalies")
-    active = latest[latest["ensemble_flag"]][["pair", "ensemble_score", "n_flags"]]
-    st.dataframe(active, use_container_width=True)
+        block = z.copy()
+        block["close"] = df["close"]
+        block["stat_score"] = stat_score
+        feats[symbol] = block
+        score_cols[symbol] = stat_score
 
-    st.subheader("Regime indicators")
-    cols = st.columns(len(settings.FX_PAIRS))
-    for col, pair_cfg in zip(cols, settings.FX_PAIRS, strict=False):
-        if pair_cfg.symbol in features.columns.get_level_values(0):
-            state = compute_regimes(features, pair_cfg.symbol).state.dropna()
-            light = _TRAFFIC.get(int(state.iloc[-1]), "⚪") if not state.empty else "⚪"
-            col.metric(pair_cfg.name, light)
+    scores = pd.DataFrame(score_cols)
 
+    # Isolation Forest as a second opinion on the pooled, recent feature space.
+    pooled = pd.concat(
+        [feats[s][["return", "volatility", "range", "correlation"]].assign(pair=s) for s in feats]
+    ).dropna()
+    if len(pooled) > 50:
+        x = pooled[["return", "volatility", "range", "correlation"]].to_numpy()
+        model = IsolationForest(contamination=0.05, random_state=0, n_estimators=150).fit(x)
+        iso = pd.Series(-model.decision_function(x), index=pooled.index)
+        iso = (iso - iso.min()) / (iso.max() - iso.min() + 1e-9)
+        pooled["iso"] = iso.values
+        for symbol in feats:
+            pair_iso = pooled[pooled["pair"] == symbol]["iso"]
+            blended = 0.6 * scores[symbol] + 0.4 * pair_iso.reindex(scores.index)
+            scores[symbol] = blended.fillna(scores[symbol])
 
-def _page_pair_deep_dive(features: pd.DataFrame, ens: pd.DataFrame) -> None:
-    """Render the per-pair deep-dive page."""
-    st.header("Pair deep dive")
-    pairs = list(features.columns.get_level_values(0).unique())
-    pair = st.selectbox("Pair", pairs)
-
-    close = features[(pair, "close")]
-    pair_ens = ens[ens["pair"] == pair].set_index("datetime")
-    flagged = pair_ens[pair_ens["ensemble_flag"]]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=close.index, y=close.values, name="Close"))
-    fig.add_trace(
-        go.Scatter(
-            x=flagged.index,
-            y=close.reindex(flagged.index).values,
-            mode="markers",
-            marker={"color": "red", "size": 8},
-            name="Anomaly",
-        )
-    )
-    fig.update_layout(title=f"{pair} price with anomaly overlays")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Feature time series")
-    feature_names = [c for c in features[pair].columns if c not in {"open", "high", "low", "close"}]
-    chosen = st.selectbox("Feature", feature_names)
-    st.line_chart(features[(pair, chosen)].rename(chosen))
-
-    st.subheader("Detector score breakdown")
-    score_cols = [c for c in pair_ens.columns if c.startswith("score_")]
-    st.line_chart(pair_ens[score_cols])
+    return scores, feats
 
 
-def _page_regime_analysis(features: pd.DataFrame) -> None:
-    """Render the regime-analysis page."""
-    st.header("Regime analysis")
-    pairs = list(features.columns.get_level_values(0).unique())
-    pair = st.selectbox("Pair", pairs, key="regime_pair")
-    result = compute_regimes(features, pair)
-
-    st.subheader("Regime state timeline")
-    st.line_chart(result.state)
-
-    if result.transition_matrix.size > 0:
-        st.subheader("Transition probability matrix")
-        fig = go.Figure(go.Heatmap(z=result.transition_matrix, colorscale="Blues"))
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Regime-conditional returns")
-        rets = features[(pair, "log_return")]
-        frame = pd.DataFrame({"state": result.state, "ret": rets}).dropna()
-        violin = go.Figure()
-        for state in sorted(frame["state"].unique()):
-            violin.add_trace(
-                go.Violin(y=frame[frame["state"] == state]["ret"], name=f"State {int(state)}")
-            )
-        st.plotly_chart(violin, use_container_width=True)
-
-        current = result.state.dropna()
-        if not current.empty:
-            st.metric("Current regime", f"State {int(current.iloc[-1])}")
+SEVERITY = [(0.85, "Critical", "#ef4444"), (0.7, "High", "#f59e0b"), (0.55, "Elevated", "#eab308")]
 
 
-def _page_backtest(features: pd.DataFrame) -> None:
-    """Render the backtest-results page."""
-    st.header("Backtest results")
-    if st.button("Run backtest"):
-        try:
-            with st.spinner("Running walk-forward backtest..."):
-                result = run_backtest(features, include_autoencoder=False)
-                metrics = compute_metrics(
-                    result.strategy_returns, result.equity_curve, result.trades
-                )
-        except ValueError as exc:
-            st.warning(
-                f"Backtest needs a longer history ({exc}). Set the sidebar "
-                "'Data start date' to about 2021 or earlier, then re-run."
-            )
-            return
-
-        st.subheader("Summary metrics")
-        st.dataframe(pd.Series(metrics.as_dict()).to_frame("value"), use_container_width=True)
-
-        st.subheader("Equity curve")
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(x=result.equity_curve.index, y=result.equity_curve.values, name="Strategy")
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=result.benchmark_equity.index, y=result.benchmark_equity.values, name="Benchmark"
-            )
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Per-pair performance")
-        if not result.trades.empty:
-            grouped = result.trades.groupby("pair")["trade_return"].agg(["size", "sum", "mean"])
-            st.dataframe(grouped, use_container_width=True)
+def severity(score: float) -> tuple[str, str]:
+    """Map a score to a (label, colour) severity band."""
+    for threshold, label, colour in SEVERITY:
+        if score >= threshold:
+            return label, colour
+    return "Normal", "#22c55e"
 
 
 def main() -> None:
-    """Dashboard entry point."""
-    st.set_page_config(page_title="FX Anomaly Detector", layout="wide")
-    st.title("FX Anomaly Detector")
+    """Render the single-page dashboard."""
+    years = st.sidebar.slider("Years of history", 1, 5, 2)
+    pair_label = st.sidebar.selectbox("Focus pair", list(PAIRS.values()), index=0)
+    focus = {v: k for k, v in PAIRS.items()}[pair_label]
 
-    start = st.sidebar.text_input("Data start date", "2024-01-01")
-    include_ae = st.sidebar.checkbox("Include autoencoder", value=False)
-    page = st.sidebar.radio(
-        "Page", ["Live monitor", "Pair deep dive", "Regime analysis", "Backtest results"]
+    with st.spinner("Scanning the FX market..."):
+        scores, feats = build_scores(years)
+
+    latest_date = scores.dropna(how="all").index.max()
+    latest = scores.loc[latest_date]
+    mean_stress = float(latest.mean())
+    flagged = latest[latest >= 0.55]
+    top_pair = latest.idxmax()
+    top_label, top_colour = severity(float(latest.max()))
+
+    st.markdown(
+        "<div class='hero'><h1>📡 FX Anomaly Radar</h1>"
+        "<p>Fast, multivariate anomaly detection across the G10 majors.</p></div>",
+        unsafe_allow_html=True,
     )
+    st.caption(f"Live Yahoo Finance data · as of {latest_date.date()}")
 
-    features, ens = load_detections(start, include_ae)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Market stress", f"{mean_stress * 100:.0f}%")
+    c2.metric("Pairs flagged", f"{len(flagged)} / {len(PAIRS)}")
+    c3.metric("Most anomalous", PAIRS[top_pair], top_label)
+    c4.metric("Top score", f"{float(latest.max()) * 100:.0f}%")
 
-    if page == "Live monitor":
-        _page_live_monitor(features, ens)
-    elif page == "Pair deep dive":
-        _page_pair_deep_dive(features, ens)
-    elif page == "Regime analysis":
-        _page_regime_analysis(features)
-    elif page == "Backtest results":
-        _page_backtest(features)
+    left, right = st.columns([3, 2])
+
+    with left:
+        st.subheader(f"{pair_label} · price & anomalies")
+        block = feats[focus]
+        score_series = scores[focus]
+        flags = score_series[score_series >= 0.7]
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=block.index, y=block["close"], name="Close",
+                line={"color": "#6C5CE7", "width": 2},
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=flags.index, y=block["close"].reindex(flags.index),
+                mode="markers", name="Anomaly",
+                marker={"color": "#ef4444", "size": 9, "line": {"color": "#fff", "width": 1}},
+            )
+        )
+        fig.update_layout(
+            template="plotly_dark", height=360, margin={"l": 0, "r": 0, "t": 10, "b": 0},
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            legend={"orientation": "h", "y": 1.1},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        st.subheader("Anomaly score trend")
+        recent = scores[[focus]].tail(120).rename(columns={focus: pair_label})
+        trend = go.Figure()
+        trend.add_trace(
+            go.Scatter(
+                x=recent.index, y=recent[pair_label], fill="tozeroy",
+                line={"color": "#00D1B2", "width": 2}, name=pair_label,
+            )
+        )
+        trend.add_hline(y=0.7, line={"color": "#f59e0b", "dash": "dot"})
+        trend.update_layout(
+            template="plotly_dark", height=360, margin={"l": 0, "r": 0, "t": 10, "b": 0},
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", yaxis={"range": [0, 1]},
+            showlegend=False,
+        )
+        st.plotly_chart(trend, use_container_width=True)
+
+    st.subheader("Current standings")
+    table = pd.DataFrame(
+        {
+            "Pair": [PAIRS[s] for s in scores.columns],
+            "Score": [float(latest[s]) for s in scores.columns],
+            "Status": [severity(float(latest[s]))[0] for s in scores.columns],
+        }
+    ).sort_values("Score", ascending=False)
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Score": st.column_config.ProgressColumn(
+                "Anomaly score", min_value=0.0, max_value=1.0, format="%.2f"
+            )
+        },
+    )
 
 
 if __name__ == "__main__":
